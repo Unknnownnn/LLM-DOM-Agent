@@ -1,8 +1,4 @@
-// API Keys should be managed securely (e.g. via .env in server.py)
-const LLM_API_KEY = "";
-const LLM_API_URL = "";
-const MODEL_NAME = "";
-const NATIVE_APP_NAME = "com.example.llm_agent";
+
 
 const SYSTEM_PROMPT = "You are an analytical engine. Read the provided webpage text and determine the logical next step or correct option. You must return YOUR ENTIRE RESPONSE as a single, valid JSON object.";
 
@@ -38,24 +34,24 @@ browser.action.onClicked.addListener(async (tab) => {
         console.log("AutoPilot is already running. Press Alt+X to stop.");
         return;
     }
-    
+
     isAutoPilot = true;
     console.log("AutoPilot STARTED!");
-    
+
     while (isAutoPilot) {
         try {
             console.log("Sending data to Local Python Server...");
             const result = await handleLocalServerFlow(tab.id);
-            
+
             if (!result.success) {
                 console.log("AutoPilot stopping due to:", result.message);
                 isAutoPilot = false;
                 break;
             }
-            
+
             console.log("Waiting 2 seconds before next cycle...");
             await new Promise(resolve => setTimeout(resolve, 2000));
-            
+
         } catch (e) {
             console.error("Error in AutoPilot:", e);
             isAutoPilot = false;
@@ -147,7 +143,7 @@ async function handleLocalServerFlow(tabId) {
     if (!response || !response.text) {
         throw new Error("Failed to extract text from the page.");
     }
-    
+
     // 2. Send data to local HTTP server
     console.log("Sending text to local python server...");
     const serverRes = await fetch("http://localhost:5000/process", {
@@ -160,9 +156,9 @@ async function handleLocalServerFlow(tabId) {
             page_text: response.text
         })
     });
-    
+
     const actionData = await serverRes.json();
-    
+
     if (actionData.error) {
         throw new Error("Server error: " + actionData.error);
     }
@@ -173,7 +169,7 @@ async function handleLocalServerFlow(tabId) {
             action: "click_element",
             target_element_text: actionData.target_element_text
         });
-        
+
         // 4. Wait 500ms and click the 'Next' button ONLY if the click succeeded
         if (clickResponse && clickResponse.success) {
             console.log("Option clicked successfully. Waiting 500ms before clicking next...");
@@ -186,9 +182,9 @@ async function handleLocalServerFlow(tabId) {
             console.warn("Failed to mark the option. Aborting next button click.");
             return { success: false, message: "Failed to mark option." };
         }
-        
+
         return { success: true };
     }
-    
+
     return { success: false, message: "No target_element_text provided by local server." };
 }
