@@ -146,7 +146,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                     cleaned_text = clean_extracted_text(page_text)
                     
                 print("\n" + "="*50)
-                print("CLEANED TEXT BEING SENT TO LLM (OR CACHE):")
+                print("EXTRACTED TEXT:")
                 print("="*50)
                 print(cleaned_text)
                 print("="*50 + "\n")
