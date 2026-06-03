@@ -10,17 +10,12 @@ An autonomous browser extension and local Python server that extracts targeted i
 - **Fuzzy Click Matching:** The extension doesn't rely on brittle HTML classes or IDs. It uses string similarity to match the LLM's text output with the physical DOM elements on the page, accurately clicking even obfuscated or complex elements.
 - **Intelligent Caching:** Remembers previously processed pages to avoid redundant API calls, saving time and API credits.
 
-## Architecture
-
-1. **`content.js`:** Lives in the browser. Reads the DOM and performs synthetic clicks.
-2. **`background.js`:** The brain of the extension. Manages the AutoPilot loop and bridges the gap between the webpage and the local Python server.
-3. **`server.py`:** A lightweight Python HTTP server running on `localhost:5000`. It receives the raw text, cleans it, queries the OpenRouter LLM API, caches the result, and returns the exact string to click.
 
 ## Installation & Setup
 
 1. **Set up the Python Server:**
    - Install dependencies: `pip install requests`
-   - Create a `.env` file based on `.env.example` and insert your OpenRouter API Key and preferred Model ID.
+   - Create a `.env` file based on `.env.example` and insert your API Key and preferred Model ID.
    - Run the server: `python server.py`
 
 2. **Load the Extension (Firefox):**
@@ -33,5 +28,4 @@ An autonomous browser extension and local Python server that extracts targeted i
 1. Open your target webpage.
 2. Ensure `server.py` is running in your terminal.
 3. Press **`Alt+A`** (or click the extension icon) to engage AutoPilot.
-4. Watch the agent determine targets and navigate automatically!
-5. Press **`Alt+X`** to emergency-stop the AutoPilot loop.
+4. Press **`Alt+X`** to emergency-stop the AutoPilot loop.
