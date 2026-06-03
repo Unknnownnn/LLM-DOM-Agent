@@ -23,6 +23,10 @@ if not API_KEY:
 
 question_cache = {}
 
+def is_coding_question(text):
+    lower = text.lower()
+    return any(k in lower for k in ["coding question", "programming", "test case", "compiler", "run code", "compile", "expected output", "code editor"])
+
 def clean_extracted_text(text):
     """
     Cleans the jumbled extracted text and isolates the question and options.
@@ -132,7 +136,15 @@ class RequestHandler(BaseHTTPRequestHandler):
                 print(f"[*] Raw extracted text saved to extracted_data.txt ({len(page_text)} chars)")
                 
                 # --- HEURISTIC CLEANING ---
-                cleaned_text = clean_extracted_text(page_text)
+                is_coding = is_coding_question(page_text)
+                
+                if is_coding:
+                    cleaned_text = "--- CODING PROBLEM & TEST CASES ---\n\n" + page_text
+                    # Override prompt for coding
+                    system_prompt = "You are an expert programmer. Read the coding problem, constraints, and any test case outputs. Write the solution code. Respond ONLY with a valid JSON object containing a single key 'code_to_paste' mapped to the raw code snippet. No markdown formatting inside the json value string."
+                else:
+                    cleaned_text = clean_extracted_text(page_text)
+                    
                 print("\n" + "="*50)
                 print("CLEANED TEXT BEING SENT TO LLM (OR CACHE):")
                 print("="*50)

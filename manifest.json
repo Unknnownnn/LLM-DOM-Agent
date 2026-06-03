@@ -7,7 +7,7 @@
     "activeTab",
     "scripting",
     "storage",
-    "nativeMessaging"
+    "clipboardWrite"
   ],
   "host_permissions": [
     "<all_urls>"

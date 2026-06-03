@@ -124,6 +124,26 @@ browser.runtime.onMessage.addListener((request, sender, sendResponse) => {
     } else if (request.action === "click_next") {
         const success = clickNextButton();
         return Promise.resolve({ success: success });
+    } else if (request.action === "copy_to_clipboard") {
+        try {
+            if (navigator.clipboard && window.isSecureContext) {
+                navigator.clipboard.writeText(request.text).catch(() => fallbackCopy(request.text));
+            } else {
+                fallbackCopy(request.text);
+            }
+        } catch (e) {
+            console.error(e);
+        }
+        return Promise.resolve({ success: true });
+    }
+    
+    function fallbackCopy(text) {
+        const ta = document.createElement("textarea");
+        ta.value = text;
+        document.body.appendChild(ta);
+        ta.select();
+        try { document.execCommand("copy"); } catch (e) {}
+        document.body.removeChild(ta);
     }
     
     // Return true to keep the message channel open for asynchronous responses if needed

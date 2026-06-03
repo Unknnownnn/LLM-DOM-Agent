@@ -49,13 +49,18 @@ browser.action.onClicked.addListener(async (tab) => {
                 break;
             }
 
-            console.log("Waiting 2 seconds before next cycle...");
-            await new Promise(resolve => setTimeout(resolve, 2000));
-
+            console.log("Waiting 3 seconds before next cycle...");
+            await new Promise(resolve => setTimeout(resolve, 3000));
+            
         } catch (e) {
             console.error("Error in AutoPilot:", e);
-            isAutoPilot = false;
-            break;
+            if (isAutoPilot) {
+                console.log("Connection hiccup or page still loading. Retrying in 5 seconds...");
+                await new Promise(resolve => setTimeout(resolve, 5000));
+                // We DO NOT break here. It will loop back and try again!
+            } else {
+                break;
+            }
         }
     }
 });
@@ -184,7 +189,16 @@ async function handleLocalServerFlow(tabId) {
         }
 
         return { success: true };
+    } else if (actionData && actionData.code_to_paste) {
+        // --- NEW: CODING QUESTION LOGIC ---
+        await browser.tabs.sendMessage(tabId, {
+            action: "copy_to_clipboard",
+            text: actionData.code_to_paste
+        });
+        
+        console.log("Code copied to clipboard. Halting AutoPilot for manual paste and testing.");
+        return { success: false, message: "Coding question detected. Code copied to clipboard. AutoPilot paused." };
     }
-
-    return { success: false, message: "No target_element_text provided by local server." };
+    
+    return { success: false, message: "No target_element_text or code_to_paste provided by local server." };
 }
