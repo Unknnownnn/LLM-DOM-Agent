@@ -39,11 +39,10 @@ const JUNK_PATTERNS = [
 
 function isJunk(text) {
     const t = text.trim();
-    if (!t || t.length < 2) return true;
-    // Pure numbers or single chars
-    if (/^\d+$/.test(t)) return true;
-    // Single letter (A, B, C, D option labels by themselves)
-    // Note: we keep them IF they're longer
+    // Only reject truly empty strings — length and digit checks were incorrectly
+    // filtering single-letter options (A/B/C/D) and numeric options (1/2/3/4).
+    // The DOM structure check in extractAvailableOptions is the real gate.
+    if (!t) return true;
     for (const pat of JUNK_PATTERNS) {
         if (pat.test(t)) return true;
     }
