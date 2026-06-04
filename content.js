@@ -3,45 +3,39 @@ function extractHumanReadableText() {
     return text.replace(/\n\s*\n/g, '\n').trim();
 }
 
-// ─── Junk filter for option extraction ──────────────────────────────────────
-
-// Patterns that are definitely NOT answer options
 const JUNK_PATTERNS = [
-    /^answered(\s+\d+)?$/i,                          // "Answered" or "Answered 15/30"
-    /^\d+\s*\/\s*\d+$/,                               // "15/30"
-    /^marks\s*[:\-]/i,                                // "Marks : 2"
-    /^negative\s+marks/i,                             // "Negative Marks : 0"
-    /^marking\s*[:\-]/i,                              // "Marking Scheme:"
+    /^answered(\s+\d+)?$/i,                         
+    /^\d+\s*\/\s*\d+$/,                              
+    /^marks\s*[:\-]/i,                                
+    /^negative\s+marks/i,                            
+    /^marking\s*[:\-]/i,                       
     /^(next|previous|submit|clear|save\s*&\s*next|mark for review|next question)$/i,
-    /^question\s*(no|number)?\s*[:\-\d]/i,           // "Question No : 1"
+    /^question\s*(no|number)?\s*[:\-\d]/i,         
     /^category\s*:/i,
     /^quiz\s*progress/i,
-    /^(system|internet|network)\s*(status|connection)/i, // "Internet Status:", "System Status"
-    /^(online|offline|connected|disconnected)$/i,     // "Online", "Offline"
-    /^answer\s*here$/i,                               // "Answer here"
-    /^touch\s+to\s+/i,                               // "Touch to View Question", "Touch to Answer"
-    /^(tap|click|swipe|view)\s+to\s+/i,              // similar mobile UI prompts
+    /^(system|internet|network)\s*(status|connection)/i, 
+    /^(online|offline|connected|disconnected)$/i, 
+    /^answer\s*here$/i,                              
+    /^touch\s+to\s+/i,                              
+    /^(tap|click|swipe|view)\s+to\s+/i,              
     /^time\s*(left|remaining)\s*[:\-]/i,
     /^\d+\s*(sec|min|hr|second|minute|hour)/i,
     /^(easy|medium|hard|difficulty)\s*[:\-]?$/i,
-    /^(multi\s*choice|single\s*choice|multiple\s*choice)/i, // question type labels
-    // ── Coding IDE UI elements (never answer options) ─────────────────────────
-    /^provide\s*custom\s*input$/i,                    // "Provide Custom Input"
-    /^compile\s*(&|and)\s*run$/i,                     // "Compile & Run"
-    /^submit\s*code$/i,                               // "Submit Code"
-    /^debugger\s*loading/i,                           // "Debugger Loading..."
-    /^compiling/i,                                    // "Compiling..."
-    /^running/i,                                      // "Running..."
-    /^(fill\s*your|write)\s*code/i,                   // "Fill your code here"
-    /^\/\//,                                          // code comments like "// You are using GCC"
-    /^#include/i,                                     // C++ includes
+    /^(multi\s*choice|single\s*choice|multiple\s*choice)/i, 
+    /^provide\s*custom\s*input$/i,                   
+    /^compile\s*(&|and)\s*run$/i,                    
+    /^submit\s*code$/i,                               
+    /^debugger\s*loading/i,                          
+    /^compiling/i,                                  
+    /^running/i,                                     
+    /^(fill\s*your|write)\s*code/i,                   
+    /^\/\//,                                         
+    /^#include/i,                                    
 ];
 
 function isJunk(text) {
     const t = text.trim();
-    // Only reject truly empty strings — length and digit checks were incorrectly
-    // filtering single-letter options (A/B/C/D) and numeric options (1/2/3/4).
-    // The DOM structure check in extractAvailableOptions is the real gate.
+
     if (!t) return true;
     for (const pat of JUNK_PATTERNS) {
         if (pat.test(t)) return true;
@@ -49,10 +43,6 @@ function isJunk(text) {
     return false;
 }
 
-/**
- * Extract clickable option texts by walking text nodes inside likely option elements.
- * Uses the SAME TreeWalker approach as clickElementByText so texts are guaranteed to match.
- */
 function extractAvailableOptions() {
     const results = [];
     const seen = new Set();
@@ -66,7 +56,6 @@ function extractAvailableOptions() {
         if (seen.has(val.toLowerCase())) continue;
         if (isJunk(val)) continue;
 
-        // Check if this text node lives inside something clickable / option-like
         let el = node.parentElement;
         let depth = 0;
         let isOption = false;
@@ -86,9 +75,6 @@ function extractAvailableOptions() {
                 break;
             }
 
-            // Only check DIRECT children for radio/checkbox — NOT deep querySelector.
-            // Deep search would flag any element in a large container that happens to
-            // have a radio button somewhere inside (e.g. the entire question wrapper).
             for (const child of el.children) {
                 const ct = child.tagName.toUpperCase();
                 if (ct === 'INPUT' && (child.type === 'radio' || child.type === 'checkbox')) {
@@ -111,7 +97,6 @@ function extractAvailableOptions() {
     return results;
 }
 
-// ─── Local Levenshtein fuzzy match ───────────────────────────────────────────
 
 function levenshtein(a, b) {
     const m = a.length, n = b.length;
@@ -127,11 +112,6 @@ function levenshtein(a, b) {
     return dp[m][n];
 }
 
-/**
- * Find the best matching text from `candidates` for `target`.
- * Returns { match, score } where score is 0–1 (1 = perfect).
- * Returns null if nothing exceeds the threshold.
- */
 function localFuzzyMatch(target, candidates, threshold = 0.45) {
     const tLow = target.trim().toLowerCase();
     let bestMatch = null;
@@ -140,17 +120,14 @@ function localFuzzyMatch(target, candidates, threshold = 0.45) {
     for (const cand of candidates) {
         const cLow = cand.trim().toLowerCase();
 
-        // Exact
         if (cLow === tLow) return { match: cand, score: 1.0 };
 
-        // Substring containment (strong signal)
         if (tLow.includes(cLow) || cLow.includes(tLow)) {
             const score = 0.9;
             if (score > bestScore) { bestScore = score; bestMatch = cand; }
             continue;
         }
 
-        // Levenshtein ratio
         const dist = levenshtein(tLow, cLow);
         const score = 1 - dist / Math.max(tLow.length, cLow.length);
         if (score > bestScore) { bestScore = score; bestMatch = cand; }
@@ -162,7 +139,6 @@ function localFuzzyMatch(target, candidates, threshold = 0.45) {
     return null;
 }
 
-// ─── Click helpers ────────────────────────────────────────────────────────────
 
 function clickNodeText(targetText) {
     if (!targetText) return false;
@@ -228,19 +204,14 @@ function clickNodeText(targetText) {
     return false;
 }
 
-/**
- * Main click function: tries exact/partial match first, then local fuzzy fallback.
- */
 function clickElementByText(targetText) {
     if (!targetText) {
         console.error("No target text provided for clicking.");
         return false;
     }
 
-    // --- Pass 1: Direct TreeWalker match (exact / partial) ---
     if (clickNodeText(targetText)) return true;
 
-    // --- Pass 2: Local fuzzy match against available options ---
     console.warn(`[!] No direct match for "${targetText}". Running local fuzzy match...`);
     const options = extractAvailableOptions();
 
@@ -294,7 +265,6 @@ function clickNextButton() {
     return false;
 }
 
-// ─── Message listener ─────────────────────────────────────────────────────────
 
 browser.runtime.onMessage.addListener((request, sender, sendResponse) => {
     if (request.action === "extract_text") {
