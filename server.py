@@ -334,7 +334,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             if cleaned_text in question_cache:
                 print(f"[*] CACHE HIT! This exact question was already answered.")
                 print(f"[*] Waiting 5 seconds. Check for loops...")
-                time.sleep(5)
+                time.sleep(5)   
                 response_data = question_cache[cleaned_text]
             else:
                 print(f"[*] Querying {MODEL_NAME}...")
