@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "LLM DOM Agent",
-  "version": "1.0",
+  "version": "1.5",
   "description": "Extracts webpage text, queries an external LLM API, and performs DOM interactions based on AI's structured response.",
   "permissions": [
     "activeTab",
