@@ -3,7 +3,9 @@ import requests
 import re
 import time
 import os
+import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from socketserver import ThreadingMixIn
 
 # Load .env manually to avoid requiring python-dotenv
 if os.path.exists('.env'):
@@ -22,6 +24,72 @@ if not API_KEY:
     print("[!] WARNING: OPENROUTER_API_KEY is not set in .env file!")
 
 question_cache = {}
+
+# ─── Fuzzy matching utility ───────────────────────────────────────────────────
+
+def levenshtein_distance(s1, s2):
+    """Compute Levenshtein edit distance between two strings."""
+    if len(s1) < len(s2):
+        return levenshtein_distance(s2, s1)
+    if len(s2) == 0:
+        return len(s1)
+
+    prev_row = range(len(s2) + 1)
+    for i, c1 in enumerate(s1):
+        curr_row = [i + 1]
+        for j, c2 in enumerate(s2):
+            insertions = prev_row[j + 1] + 1
+            deletions = curr_row[j] + 1
+            substitutions = prev_row[j] + (c1 != c2)
+            curr_row.append(min(insertions, deletions, substitutions))
+        prev_row = curr_row
+    return prev_row[-1]
+
+
+def similarity_ratio(s1, s2):
+    """Return similarity ratio between 0 and 1 (1 = identical)."""
+    s1_lower = s1.strip().lower()
+    s2_lower = s2.strip().lower()
+    if not s1_lower or not s2_lower:
+        return 0.0
+    max_len = max(len(s1_lower), len(s2_lower))
+    dist = levenshtein_distance(s1_lower, s2_lower)
+    return 1.0 - (dist / max_len)
+
+
+def find_best_fuzzy_match(target, candidates, threshold=0.4):
+    """
+    Find the best fuzzy match for `target` among `candidates`.
+    Returns (best_candidate, score) or (None, 0) if nothing passes threshold.
+    """
+    best_match = None
+    best_score = 0.0
+
+    target_lower = target.strip().lower()
+
+    for candidate in candidates:
+        cand_lower = candidate.strip().lower()
+
+        # Exact match
+        if cand_lower == target_lower:
+            return candidate, 1.0
+
+        # Substring containment (high confidence)
+        if target_lower in cand_lower or cand_lower in target_lower:
+            score = 0.9
+        else:
+            score = similarity_ratio(target_lower, cand_lower)
+
+        if score > best_score:
+            best_score = score
+            best_match = candidate
+
+    if best_score >= threshold:
+        return best_match, best_score
+    return None, 0.0
+
+
+# ─── Text cleaning ────────────────────────────────────────────────────────────
 
 def is_coding_question(text):
     lower = text.lower()
@@ -111,7 +179,19 @@ def clean_extracted_text(text):
         
     return "--- RAW CONDENSED TEXT ---\n\n" + "\n".join(lines)
 
+
+# ─── Threaded HTTP Server ─────────────────────────────────────────────────────
+
+class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+    """Handle requests in separate threads to prevent blocking."""
+    daemon_threads = True
+
+
 class RequestHandler(BaseHTTPRequestHandler):
+    # Suppress default logging to keep terminal clean (we log manually)
+    def log_message(self, format, *args):
+        return
+
     def do_OPTIONS(self):
         # Handle CORS preflight
         self.send_response(200, "ok")
@@ -120,84 +200,215 @@ class RequestHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Headers", "X-Requested-With, Content-Type")
         self.end_headers()
 
-    def do_POST(self):
-        if self.path == '/process':
-            content_length = int(self.headers['Content-Length'])
-            post_data = self.rfile.read(content_length)
-            
+    def do_GET(self):
+        """Health check endpoint for the extension to verify connectivity."""
+        if self.path == '/health':
             try:
-                data = json.loads(post_data.decode('utf-8'))
-                page_text = data.get('page_text', '')
-                system_prompt = data.get('system_prompt', "You are an analytical engine...")
-                
-                # --- CACHE LOCALLY ---
-                with open("extracted_data.txt", "w", encoding="utf-8") as f:
-                    f.write(page_text)
-                print(f"[*] Raw extracted text saved to extracted_data.txt ({len(page_text)} chars)")
-                
-                # --- HEURISTIC CLEANING ---
-                is_coding = is_coding_question(page_text)
-                
-                if is_coding:
-                    cleaned_text = "--- CODING PROBLEM & TEST CASES ---\n\n" + page_text
-                    # Override prompt for coding
-                    system_prompt = "You are an expert programmer. Read the coding problem, constraints, and any test case outputs. Write the solution code. Respond ONLY with a valid JSON object containing a single key 'code_to_paste' mapped to the raw code snippet. No markdown formatting inside the json value string."
-                else:
-                    cleaned_text = clean_extracted_text(page_text)
-                    
-                print("\n" + "="*50)
-                print("EXTRACTED TEXT:")
-                print("="*50)
-                print(cleaned_text)
-                print("="*50 + "\n")
-                
-                # --- CACHE LOGIC ---
-                if cleaned_text in question_cache:
-                    print(f"[*] CACHE HIT! This exact question was already answered.")
-                    print(f"[*] Waiting 5 seconds. Check for loops...")
-                    time.sleep(5)
-                    response_data = question_cache[cleaned_text]
-                else:
-                    print(f"[*] Querying OpenRouter model...")
-                    response_data = self.query_llm(cleaned_text, system_prompt)
-                    # Save to cache if successful
-                    if "error" not in response_data:
-                        question_cache[cleaned_text] = response_data
-                
-                try:
-                    self.send_response(200)
-                    self.send_header('Content-type', 'application/json')
-                    self.send_header('Access-Control-Allow-Origin', '*')
-                    self.end_headers()
-                    self.wfile.write(json.dumps(response_data).encode('utf-8'))
-                    print(f"[*] Response sent to extension: {response_data}")
-                except (ConnectionAbortedError, BrokenPipeError):
-                    print("[!] Browser closed the connection early. Ignoring.")
-                
-            except Exception as e:
-                self.send_response(500)
+                self.send_response(200)
                 self.send_header('Content-type', 'application/json')
                 self.send_header('Access-Control-Allow-Origin', '*')
                 self.end_headers()
-                self.wfile.write(json.dumps({"error": str(e)}).encode('utf-8'))
-                print(f"[!] Error: {e}")
+                self.wfile.write(json.dumps({"status": "ok"}).encode('utf-8'))
+            except (ConnectionAbortedError, BrokenPipeError, ConnectionResetError, OSError):
+                pass
+            return
+
+    def _safe_send_response(self, data):
+        """Safely send JSON response, handling broken connections gracefully."""
+        try:
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.send_header('Connection', 'close')
+            self.end_headers()
+            self.wfile.write(json.dumps(data).encode('utf-8'))
+            self.wfile.flush()
+            return True
+        except (ConnectionAbortedError, BrokenPipeError, ConnectionResetError, OSError) as e:
+            print(f"[!] Connection lost while sending response: {type(e).__name__}. Extension may have timed out.")
+            print(f"[!] The answer was: {json.dumps(data, indent=2)}")
+            print(f"[!] ↑ Answer printed above for manual use if needed.")
+            return False
+
+    def _safe_send_error(self, status_code, data):
+        """Safely send error response."""
+        try:
+            self.send_response(status_code)
+            self.send_header('Content-type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.send_header('Connection', 'close')
+            self.end_headers()
+            self.wfile.write(json.dumps(data).encode('utf-8'))
+            self.wfile.flush()
+        except (ConnectionAbortedError, BrokenPipeError, ConnectionResetError, OSError):
+            print(f"[!] Could not send error response (connection already dead).")
+
+    def do_POST(self):
+        if self.path == '/process':
+            self._handle_process()
+        else:
+            self._safe_send_error(404, {"error": "Not found"})
+
+    def _handle_fuzzy_match(self):
+        """
+        Endpoint for the extension to find the best fuzzy match for a target
+        among the available options on the page.
+        Expects: { "target": "...", "candidates": ["opt1", "opt2", ...] }
+        Returns: { "best_match": "...", "score": 0.85 } or { "best_match": null }
+        """
+        try:
+            content_length = int(self.headers['Content-Length'])
+            post_data = self.rfile.read(content_length)
+            data = json.loads(post_data.decode('utf-8'))
+
+            target = data.get('target', '')
+            candidates = data.get('candidates', [])
+
+            print(f"\n{'─'*50}")
+            print(f"[FUZZY MATCH] Target: \"{target}\"")
+            print(f"[FUZZY MATCH] Candidates ({len(candidates)}):")
+            for i, c in enumerate(candidates):
+                print(f"  [{i+1}] \"{c}\"")
+
+            best_match, score = find_best_fuzzy_match(target, candidates)
+
+            if best_match:
+                print(f"[FUZZY MATCH] ✓ Best match: \"{best_match}\" (score: {score:.2f})")
+            else:
+                print(f"[FUZZY MATCH] ✗ No match found above threshold")
+            print(f"{'─'*50}\n")
+
+            self._safe_send_response({
+                "best_match": best_match,
+                "score": score
+            })
+
+        except Exception as e:
+            print(f"[!] Fuzzy match error: {e}")
+            self._safe_send_error(500, {"error": str(e)})
+
+    def _handle_process(self):
+        try:
+            content_length = int(self.headers['Content-Length'])
+            post_data = self.rfile.read(content_length)
+        except (ConnectionAbortedError, BrokenPipeError, ConnectionResetError, OSError) as e:
+            print(f"[!] Connection lost while reading request body: {type(e).__name__}")
+            return
+
+        try:
+            data = json.loads(post_data.decode('utf-8'))
+            page_text = data.get('page_text', '')
+            system_prompt = data.get('system_prompt', "You are an analytical engine...")
+            available_options = data.get('available_options', [])
+            
+            # --- CACHE LOCALLY ---
+            with open("extracted_data.txt", "w", encoding="utf-8") as f:
+                f.write(page_text)
+            print(f"\n[*] Raw extracted text saved to extracted_data.txt ({len(page_text)} chars)")
+            
+            # --- HEURISTIC CLEANING ---
+            is_coding = is_coding_question(page_text)
+            
+            if is_coding:
+                cleaned_text = "--- CODING PROBLEM & TEST CASES ---\n\n" + page_text
+                # Override prompt for coding
+                system_prompt = "You are an expert programmer. Read the coding problem, constraints, and any test case outputs. Write the solution code. Respond ONLY with a valid JSON object containing a single key 'code_to_paste' mapped to the raw code snippet. No markdown formatting inside the json value string."
+            else:
+                cleaned_text = clean_extracted_text(page_text)
                 
-    def query_llm(self, page_text, system_prompt):
+            print("\n" + "="*50)
+            print("EXTRACTED TEXT:")
+            print("="*50)
+            print(cleaned_text)
+            print("="*50)
+
+            # Log available options if provided
+            if available_options:
+                print(f"\n[*] Available options on page ({len(available_options)}):")
+                for i, opt in enumerate(available_options):
+                    print(f"    [{i+1}] \"{opt}\"")
+
+            print()
+            
+            # --- CACHE LOGIC ---
+            if cleaned_text in question_cache:
+                print(f"[*] CACHE HIT! This exact question was already answered.")
+                print(f"[*] Waiting 5 seconds. Check for loops...")
+                time.sleep(5)
+                response_data = question_cache[cleaned_text]
+            else:
+                print(f"[*] Querying {MODEL_NAME}...")
+                response_data = self.query_llm(cleaned_text, system_prompt, available_options)
+                # Save to cache if successful
+                if "error" not in response_data:
+                    question_cache[cleaned_text] = response_data
+
+            # --- VERBOSE LOGGING: Show exactly what we're sending back ---
+            print(f"\n{'─'*50}")
+            print(f"[*] RESPONSE TO EXTENSION:")
+            print(json.dumps(response_data, indent=2))
+            
+            # --- DIAGNOSTIC: Show match status for terminal visibility ---
+            target = response_data.get('target_element_text', '')
+            if target and available_options:
+                exact_found = any(opt.strip().lower() == target.strip().lower() for opt in available_options)
+                if exact_found:
+                    print(f"[✓] LLM target \'{target}\' found exactly in available options.")
+                else:
+                    print(f"[~] LLM target \'{target}\' not in options list — content.js will fuzzy-match locally.")
+                    print(f"[~] Available: {available_options}")
+            
+            print(f"{'─'*50}\n")
+            
+            sent = self._safe_send_response(response_data)
+            if sent:
+                print(f"[*] Response sent successfully to extension.")
+            else:
+                print(f"[!] Response could NOT be sent (connection dead).")
+                print(f"[!] Answer for manual use: {json.dumps(response_data)}")
+            
+        except Exception as e:
+            print(f"[!] Error processing request: {e}")
+            import traceback
+            traceback.print_exc()
+            self._safe_send_error(500, {"error": str(e)})
+                
+    def query_llm(self, page_text, system_prompt, available_options=None):
         url = API_URL
         headers = {
             "Authorization": f"Bearer {API_KEY}",
             "Content-Type": "application/json"
         }
+
+        # Build user message with available options for better accuracy
+        user_msg = f"Here is the webpage text:\n\n{page_text}\n\n"
+        if available_options and len(available_options) > 0:
+            user_msg += f"The available clickable options on the page are:\n"
+            for i, opt in enumerate(available_options):
+                user_msg += f"  {i+1}. {opt}\n"
+            user_msg += f"\nYou MUST pick one of these exact options. "
+        user_msg += "Respond ONLY with a valid JSON object containing a single key 'target_element_text' mapped to the exact string of the correct option to click."
+
         payload = {
             "model": MODEL_NAME,
             "messages": [
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"Here is the webpage text:\n\n{page_text}\n\nRespond ONLY with a valid JSON object containing a single key 'target_element_text' mapped to the exact string of the correct option to click."}
+                {"role": "user", "content": user_msg}
             ]
         }
         
-        response = requests.post(url, headers=headers, json=payload)
-        response_json = response.json()
+        try:
+            response = requests.post(url, headers=headers, json=payload, timeout=120)
+            response_json = response.json()
+        except requests.exceptions.Timeout:
+            print("[!] LLM API timed out after 120 seconds!")
+            return {"error": "LLM API timeout"}
+        except requests.exceptions.ConnectionError as e:
+            print(f"[!] Could not connect to LLM API: {e}")
+            return {"error": f"LLM API connection error: {str(e)}"}
+        except Exception as e:
+            print(f"[!] Unexpected error calling LLM API: {e}")
+            return {"error": str(e)}
         
         if 'choices' not in response_json:
             return {"error": f"API Error: {json.dumps(response_json)}"}
@@ -218,12 +429,22 @@ class RequestHandler(BaseHTTPRequestHandler):
         try:
             return json.loads(content)
         except json.JSONDecodeError:
+            # Try to extract JSON from the response
+            json_match = re.search(r'\{[^}]+\}', content)
+            if json_match:
+                try:
+                    return json.loads(json_match.group())
+                except json.JSONDecodeError:
+                    pass
             return {"error": "Failed to parse JSON", "raw_content": content}
 
-def run(server_class=HTTPServer, handler_class=RequestHandler, port=5000):
+
+def run(server_class=ThreadedHTTPServer, handler_class=RequestHandler, port=5000):
     server_address = ('', port)
     httpd = server_class(server_address, handler_class)
     print(f"[*] Local Python Server running on http://localhost:{port}")
+    print(f"[*] Health check: http://localhost:{port}/health")
+    print(f"[*] Fuzzy match:  http://localhost:{port}/fuzzy_match")
     print(f"[*] Waiting for data from the browser extension...")
     httpd.serve_forever()
 
