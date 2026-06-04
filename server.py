@@ -92,8 +92,65 @@ def find_best_fuzzy_match(target, candidates, threshold=0.4):
 # ─── Text cleaning ────────────────────────────────────────────────────────────
 
 def is_coding_question(text):
+    """
+    Classify whether the page is a coding/programming question or an MCQ.
+
+    Strategy: use STRONG signals (structural markers unique to coding pages) that
+    immediately return True, plus WEAK signals that need 2+ hits. This avoids
+    misclassifying MCQs that happen to mention words like "programming" in the
+    question body.
+    """
     lower = text.lower()
-    return any(k in lower for k in ["coding question", "programming", "test case", "compiler", "run code", "compile", "expected output", "code editor"])
+    lines_lower = [l.strip().lower() for l in text.splitlines() if l.strip()]
+
+    # ── STRONG signals: any one of these alone = coding question ─────────────
+    # Note: these are structural/UI markers that ONLY appear on coding pages,
+    # never on MCQ pages. Even partial page load signals are included so we
+    # catch the IDE before it finishes rendering.
+    STRONG = [
+        "single file programming question",   # section header on this platform
+        "problem statement",                   # coding problem header
+        "input format",                        # coding problem input spec
+        "output format",                       # coding problem output spec
+        "sample test cases",                   # test case block
+        "compile & run",                       # coding IDE run button
+        "submit code",                         # coding submit button
+        "fill your code here",                 # code editor placeholder
+        "code constraints",                    # constraints section
+        "expected output",                     # test case expected output
+        "code editor",                         # code editor label
+        "provide custom input",                # coding IDE custom input feature
+        "debugger loading",                    # IDE still initializing (partial load)
+        "compiling...",                        # compile in progress
+        "running...",                          # code running in IDE
+    ]
+    for signal in STRONG:
+        if signal in lower:
+            print(f"[classify] CODING (strong signal: '{signal}')")
+            return True
+
+    # ── STRUCTURAL: input+output pattern together = unambiguous coding page ──
+    has_input_format  = any("input" in l and ("format" in l or ":" in l) for l in lines_lower)
+    has_output_format = any("output" in l and ("format" in l or ":" in l) for l in lines_lower)
+    if has_input_format and has_output_format:
+        print("[classify] CODING (structural: input format + output format both present)")
+        return True
+
+    # ── WEAK signals: need 2+ hits to be sure ────────────────────────────────
+    WEAK = [
+        "coding question", "programming", "test case", "compiler",
+        "run code", "compile", "code snippet", "algorithm", "function",
+        "write a program", "implement", "return the", "def ", "int main",
+        "public static void", "#include",
+    ]
+    hits = sum(1 for kw in WEAK if kw in lower)
+    if hits >= 2:
+        print(f"[classify] CODING (weak signals: {hits} hits)")
+        return True
+
+    print("[classify] MCQ")
+    return False
+
 
 def clean_extracted_text(text):
     """
@@ -306,27 +363,40 @@ class RequestHandler(BaseHTTPRequestHandler):
                 f.write(page_text)
             print(f"\n[*] Raw extracted text saved to extracted_data.txt ({len(page_text)} chars)")
             
-            # --- HEURISTIC CLEANING ---
+            # --- CLASSIFY & CLEAN ---
             is_coding = is_coding_question(page_text)
-            
+
             if is_coding:
                 cleaned_text = "--- CODING PROBLEM & TEST CASES ---\n\n" + page_text
-                # Override prompt for coding
-                system_prompt = "You are an expert programmer. Read the coding problem, constraints, and any test case outputs. Write the solution code. Respond ONLY with a valid JSON object containing a single key 'code_to_paste' mapped to the raw code snippet. No markdown formatting inside the json value string."
+                # Override prompt for coding: only ask for code, never options
+                system_prompt = (
+                    "You are an expert programmer. Read the coding problem, constraints, "
+                    "and the sample test cases carefully. Write a complete, correct solution. "
+                    "Respond ONLY with a valid JSON object with a single key 'code_to_paste' "
+                    "mapped to the raw code string. No markdown, no triple-backticks inside the value."
+                )
+                # NEVER send available_options to the LLM for coding questions.
+                # The page may have UI buttons ('Provide Custom Input', 'Compile & Run')
+                # that look like options but aren't. Sending them causes the LLM to
+                # return target_element_text instead of code_to_paste.
+                available_options = []
+                print("[classify] Coding question — available_options suppressed.")
             else:
                 cleaned_text = clean_extracted_text(page_text)
-                
+
             print("\n" + "="*50)
             print("EXTRACTED TEXT:")
             print("="*50)
             print(cleaned_text)
             print("="*50)
 
-            # Log available options if provided
+            # Log available options (MCQ only — will be empty for coding)
             if available_options:
                 print(f"\n[*] Available options on page ({len(available_options)}):")
                 for i, opt in enumerate(available_options):
                     print(f"    [{i+1}] \"{opt}\"")
+            elif not is_coding:
+                print("\n[!] No available options detected on page (MCQ with no radio buttons found?)")
 
             print()
             

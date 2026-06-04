@@ -25,6 +25,16 @@ const JUNK_PATTERNS = [
     /^\d+\s*(sec|min|hr|second|minute|hour)/i,
     /^(easy|medium|hard|difficulty)\s*[:\-]?$/i,
     /^(multi\s*choice|single\s*choice|multiple\s*choice)/i, // question type labels
+    // ── Coding IDE UI elements (never answer options) ─────────────────────────
+    /^provide\s*custom\s*input$/i,                    // "Provide Custom Input"
+    /^compile\s*(&|and)\s*run$/i,                     // "Compile & Run"
+    /^submit\s*code$/i,                               // "Submit Code"
+    /^debugger\s*loading/i,                           // "Debugger Loading..."
+    /^compiling/i,                                    // "Compiling..."
+    /^running/i,                                      // "Running..."
+    /^(fill\s*your|write)\s*code/i,                   // "Fill your code here"
+    /^\/\//,                                          // code comments like "// You are using GCC"
+    /^#include/i,                                     // C++ includes
 ];
 
 function isJunk(text) {
