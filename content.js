@@ -47,6 +47,7 @@ function extractAvailableOptions() {
     const results = [];
     const seen = new Set();
 
+    // ── Pass 1: walk text nodes, look for radio/checkbox/label/role ancestors ──
     const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null, false);
     let node;
 
@@ -91,6 +92,26 @@ function extractAvailableOptions() {
         if (isOption) {
             seen.add(val.toLowerCase());
             results.push(val);
+        }
+    }
+
+    // ── Pass 2: fallback for platforms with clickable divs and no radio inputs ──
+    // Look for elements that have a click handler or data-* attribute and whose
+    // text is short (< 120 chars) — typical of MCQ option divs.
+    if (results.length === 0) {
+        const candidates = document.querySelectorAll(
+            'li, [data-key], [data-value], [data-option], [data-id], [data-index], ' +
+            '[data-answer], [data-choice], [onclick], [ng-click], [data-testid]'
+        );
+        for (const el of candidates) {
+            const text = (el.innerText || el.textContent || '').trim();
+            if (!text || text.length < 1 || text.length > 120) continue;
+            if (seen.has(text.toLowerCase())) continue;
+            if (isJunk(text)) continue;
+            // Skip if element contains child elements (probably a container, not a leaf option)
+            if (el.children.length > 3) continue;
+            seen.add(text.toLowerCase());
+            results.push(text);
         }
     }
 
@@ -150,45 +171,67 @@ function clickNodeText(targetText) {
 
     const targetClean = targetText.trim().toLowerCase();
 
+    const matches = [];
     while ((node = walker.nextNode())) {
         const val = node.nodeValue.trim();
         if (!val || val.length > 250) continue;
-
-        if (val === targetText.trim()) {
-            exactMatch = node;
-            break;
-        }
-
+        
         const valClean = val.toLowerCase();
-        if (valClean === targetClean) {
-            exactMatch = node;
+        if (val === targetText.trim()) {
+            matches.push({ node, exact: true });
+        } else if (valClean === targetClean) {
+            matches.push({ node, exact: true });
         } else if (valClean.includes(targetClean) || targetClean.includes(valClean)) {
             if (valClean.length > 2 && targetClean.length > 2) {
-                if (!partialMatch) partialMatch = node;
+                matches.push({ node, exact: false });
             }
         }
     }
 
-    const targetNode = exactMatch || partialMatch;
-    if (!targetNode) return false;
+    if (matches.length === 0) return false;
 
-    let element = targetNode.parentElement;
-    let clickable = element;
-    while (clickable && clickable.tagName !== 'BODY') {
-        const tag = clickable.tagName.toUpperCase();
-        const role = clickable.getAttribute('role');
-        const cName = typeof clickable.className === 'string' ? clickable.className.toLowerCase() : '';
+    // Helper to check if a node has a valid clickable option wrapper
+    function findClickableWrapper(startNode) {
+        let el = startNode.parentElement;
+        while (el && el.tagName !== 'BODY') {
+            const tag = el.tagName.toUpperCase();
+            const role = el.getAttribute('role') || '';
+            const cName = typeof el.className === 'string' ? el.className.toLowerCase() : '';
 
-        if (
-            tag === 'LABEL' || tag === 'BUTTON' || tag === 'INPUT' || tag === 'A' ||
-            role === 'button' || role === 'radio' || role === 'checkbox' ||
-            cName.includes('option') || cName.includes('radio')
-        ) {
-            element = clickable;
-            break;
+            if (
+                tag === 'LABEL' || tag === 'BUTTON' || tag === 'INPUT' || tag === 'A' || tag === 'LI' ||
+                role === 'button' || role === 'radio' || role === 'checkbox' || role === 'option' ||
+                cName.includes('option') || cName.includes('radio') || cName.includes('choice') || cName.includes('answer') ||
+                el.hasAttribute('onclick') || el.hasAttribute('ng-click') || el.hasAttribute('data-value') || 
+                el.hasAttribute('data-key') || el.hasAttribute('data-option') || el.hasAttribute('data-id')
+            ) {
+                return el;
+            }
+            // Check if it contains a radio/checkbox
+            const radio = el.querySelector('input[type="radio"], input[type="checkbox"]');
+            if (radio) return el;
+            
+            el = el.parentElement;
         }
-        clickable = clickable.parentElement;
+        return null;
     }
+
+    // Score and pick the best node to click
+    let element = null;
+    let bestScore = -1;
+
+    for (const m of matches) {
+        const wrapper = findClickableWrapper(m.node);
+        let score = 0;
+        if (m.exact) score += 10;
+        if (wrapper) score += 5; // Heavily prefer actual option elements
+        
+        if (score > bestScore) {
+            bestScore = score;
+            element = wrapper || m.node.parentElement; // Fallback to raw parent if no wrapper
+        }
+    }
+
 
     if (element) {
         console.log(`[click] Found "${targetText}" →`, element);

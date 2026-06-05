@@ -157,8 +157,6 @@ def strip_pii(text):
         if stripped and any(p.search(stripped) for p in PII_LINE_PATTERNS):
             remove_indices.add(i)
 
-    # ── Pass 2: also remove up to 2 non-empty lines BEFORE a reg-anchor ───────
-    # Works on original `lines` so the anchor itself is still present here.
     CONTEXT_LINES = 2
     for i, line in enumerate(lines):
         if REG_ANCHOR.match(line):
@@ -238,8 +236,6 @@ def clean_extracted_text(text):
     """
     lines = [line.strip() for line in text.split('\n') if line.strip()]
     
-    # --- HEURISTIC 1: Exam Platform Pattern ---
-    # Look for explicit Exam Platform markers like "Question No :" or "Question 1 of 3"
     start_idx = -1
     for i, line in enumerate(lines):
         lower = line.lower()
@@ -512,6 +508,26 @@ class RequestHandler(BaseHTTPRequestHandler):
                 print("[classify] Coding question — available_options suppressed.")
             else:
                 cleaned_text = clean_extracted_text(page_text)
+                # Fallback: if content.js failed to find all 4 options, try to recover them
+                # from the bottom of the cleaned text block (where options usually reside).
+                if len(available_options) < 4:
+                    lines = [line.strip() for line in cleaned_text.splitlines() if line.strip()]
+                    # Grab up to the last 5 lines, filter out headers/junk
+                    bottom_lines = lines[-5:]
+                    recovered = []
+                    for line in bottom_lines:
+                        if line == "--- QUESTION BLOCK ---" or line == "--- RAW CONDENSED TEXT ---": continue
+                        if len(line) > 150: continue # options usually aren't giant paragraphs
+                        if line not in available_options and line not in recovered:
+                            recovered.append(line)
+                    
+                    if recovered:
+                        print(f"[*] Recovered {len(recovered)} potential options from text bottom to supplement options.")
+                        available_options.extend(recovered)
+                        # Keep only the last 4 if we somehow overshot (unlikely to have >5)
+                        if len(available_options) > 4:
+                            available_options = available_options[-4:]
+
 
             print("\n" + "="*50)
             print("EXTRACTED TEXT:")
@@ -628,18 +644,36 @@ class RequestHandler(BaseHTTPRequestHandler):
             content = content.split("```json")[1].split("```")[0].strip()
         elif content.strip().startswith("```"):
             content = content.split("```")[1].split("```")[0].strip()
-            
+
         try:
-            return json.loads(content)
+            parsed = json.loads(content)
         except json.JSONDecodeError:
-            # Try to extract JSON from the response
             json_match = re.search(r'\{[^}]+\}', content)
             if json_match:
                 try:
-                    return json.loads(json_match.group())
+                    parsed = json.loads(json_match.group())
                 except json.JSONDecodeError:
-                    pass
-            return {"error": "Failed to parse JSON", "raw_content": content}
+                    return {"error": "Failed to parse JSON", "raw_content": content}
+            else:
+                return {"error": "Failed to parse JSON", "raw_content": content}
+
+        # Normalize alternative keys that LLMs sometimes return instead of the expected ones.
+        # MCQ fallback keys → target_element_text
+        FALLBACK_MCQ_KEYS = ["correct_option", "answer", "selected_option", "choice", "option", "correct_answer"]
+        if "target_element_text" not in parsed and "code_to_paste" not in parsed:
+            for key in FALLBACK_MCQ_KEYS:
+                if key in parsed:
+                    val = parsed[key]
+                    print(f"[!] LLM used non-standard key '{key}' — mapping to 'target_element_text'")
+                    return {"target_element_text": str(val)}
+            # Last resort: if there's exactly one string value, use it
+            str_values = {k: v for k, v in parsed.items() if isinstance(v, str)}
+            if len(str_values) == 1:
+                key, val = next(iter(str_values.items()))
+                print(f"[!] LLM returned single string key '{key}' — treating as target_element_text")
+                return {"target_element_text": val}
+
+        return parsed
 
 
 def run(server_class=ThreadedHTTPServer, handler_class=RequestHandler, port=5000):
