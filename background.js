@@ -3,12 +3,17 @@
 const SYSTEM_PROMPT = "You are an analytical engine. Read the provided webpage text and determine the logical next step or correct option. You must return YOUR ENTIRE RESPONSE as a single, valid JSON object.";
 
 const LOCAL_SERVER_URL = "http://localhost:5000";
-const FETCH_TIMEOUT_MS = 90000;   // 90 seconds — plenty for LLM round-trip
+const FETCH_TIMEOUT_MS = 120000;  
 const MAX_RETRIES = 3;
-const RETRY_BASE_DELAY_MS = 2000; // 2s, 4s, 8s exponential backoff
+const RETRY_BASE_DELAY_MS = 2000; 
+
+const FATAL_STOP_REASONS = [
+    "Local server is not reachable",
+    "No next button found",
+    "Coding question detected"
+];
 
 browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
-    // Allows manual triggers from other parts of the extension if added later
     if (message.action === "process_page_via_api") {
         handleApiFlow(message.tabId)
             .then(result => sendResponse(result))
@@ -26,21 +31,74 @@ browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
 let isAutoPilot = false;
 
+// ─── Persist autopilot state so SW restarts don't kill the loop ─────────────
+
+async function setAutoPilot(val) {
+    isAutoPilot = val;
+    await browser.storage.session.set({ isAutoPilot: val });
+}
+
+// Keep the service worker alive every 25s during autopilot.
+// Firefox kills idle MV3 SWs after ~30s — this prevents that.
+function startKeepalive() {
+    browser.alarms.create('keepalive', { periodInMinutes: 0.4 }); // ~24s
+}
+function stopKeepalive() {
+    browser.alarms.clear('keepalive');
+}
+
+browser.alarms.onAlarm.addListener((alarm) => {
+    if (alarm.name === 'keepalive') {
+        // Ping ourselves to stay alive — no-op beyond that
+        console.log('[keepalive] SW pinged to stay alive.');
+    }
+});
+
+// On SW startup: check if autopilot was running before the SW was killed
+browser.runtime.onStartup.addListener(async () => {
+    const { isAutoPilot: wasRunning } = await browser.storage.session.get('isAutoPilot');
+    if (wasRunning) {
+        console.log('[startup] Autopilot was running before SW restart — resuming...');
+        resumeAutoPilot();
+    }
+});
+
+// Also check on SW install/update
+browser.runtime.onInstalled.addListener(async () => {
+    // Clear stale state on fresh install
+    await browser.storage.session.set({ isAutoPilot: false });
+});
+
 browser.commands.onCommand.addListener((command) => {
     if (command === "stop_autopilot") {
-        isAutoPilot = false;
+        setAutoPilot(false);
+        stopKeepalive();
         console.log("AutoPilot STOPPED by user (Alt+X)!");
     }
 });
 
-// Listener for the extension icon click (or Alt+A)
 browser.action.onClicked.addListener(async (tab) => {
     if (isAutoPilot) {
         console.log("AutoPilot is already running. Press Alt+X to stop.");
         return;
     }
+    await runAutoPilot(tab.id);
+});
 
-    isAutoPilot = true;
+async function resumeAutoPilot() {
+    // Find the active tab to resume on
+    const tabs = await browser.tabs.query({ active: true, currentWindow: true });
+    if (tabs.length === 0) {
+        console.warn('[resume] No active tab found — cannot resume autopilot.');
+        await setAutoPilot(false);
+        return;
+    }
+    await runAutoPilot(tabs[0].id);
+}
+
+async function runAutoPilot(tabId) {
+    await setAutoPilot(true);
+    startKeepalive();
     console.log("AutoPilot STARTED!");
 
     let lastPageText = '';
@@ -48,20 +106,26 @@ browser.action.onClicked.addListener(async (tab) => {
     while (isAutoPilot) {
         try {
             console.log("Sending data to Local Python Server...");
-            const result = await handleLocalServerFlow(tab.id, lastPageText);
+            const result = await handleLocalServerFlow(tabId, lastPageText);
 
             if (result.newPageText) {
                 lastPageText = result.newPageText;
             }
 
             if (!result.success) {
-                console.log("AutoPilot stopping due to:", result.message);
-                isAutoPilot = false;
-                break;
+                const msg = result.message || '';
+                const isFatal = FATAL_STOP_REASONS.some(r => msg.includes(r));
+                if (isFatal) {
+                    console.log("AutoPilot stopping due to:", msg);
+                    await setAutoPilot(false);
+                    stopKeepalive();
+                    break;
+                } else {
+                    console.warn(`[!] Transient failure: "${msg}" — retrying in 4s...`);
+                    await new Promise(resolve => setTimeout(resolve, 4000));
+                }
             }
 
-            // No fixed delay here — handleLocalServerFlow already waited for page change
-            
         } catch (e) {
             console.error("Error in AutoPilot:", e);
             if (isAutoPilot) {
@@ -72,9 +136,14 @@ browser.action.onClicked.addListener(async (tab) => {
             }
         }
     }
-});
 
-// ─── Utility: Fetch with timeout + retries ──────────────────────────────────
+    // Clean up if we exited normally
+    if (!isAutoPilot) {
+        stopKeepalive();
+    }
+    console.log("AutoPilot loop exited.");
+}
+
 
 async function fetchWithTimeout(url, options, timeoutMs = FETCH_TIMEOUT_MS) {
     const controller = new AbortController();
@@ -115,7 +184,6 @@ async function fetchWithRetry(url, options, maxRetries = MAX_RETRIES, timeoutMs 
     throw new Error(`All ${maxRetries} fetch attempts failed. Last error: ${lastError.message}`);
 }
 
-// ─── Utility: Check server health ───────────────────────────────────────────
 
 async function checkServerHealth() {
     try {
@@ -130,7 +198,34 @@ async function checkServerHealth() {
     }
 }
 
-// ─── Utility: Extract clickable option texts from the page ──────────────────
+// Poll /result/<job_id> every 2s until status === "done" or timeout.
+async function pollJobResult(jobId, timeoutMs = 180000) {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+        await new Promise(r => setTimeout(r, 2000));
+        try {
+            const res = await fetchWithTimeout(`${LOCAL_SERVER_URL}/result/${jobId}`, { method: 'GET' }, 5000);
+            if (!res.ok) {
+                console.warn(`[poll] /result/${jobId} returned ${res.status}`);
+                continue;
+            }
+            const job = await res.json();
+            if (job.status === 'done') {
+                console.log(`[poll] Job ${jobId} done:`, job.result);
+                return job.result;
+            } else if (job.status === 'error') {
+                console.error(`[poll] Job ${jobId} failed:`, job.result);
+                return null;
+            }
+            console.log(`[poll] Job ${jobId} still pending...`);
+        } catch (e) {
+            console.warn(`[poll] Error polling job ${jobId}:`, e.message);
+        }
+    }
+    console.error(`[poll] Job ${jobId} timed out after ${timeoutMs / 1000}s`);
+    return null;
+}
+
 
 async function extractAvailableOptions(tabId) {
     try {
@@ -144,16 +239,6 @@ async function extractAvailableOptions(tabId) {
     return [];
 }
 
-// Fuzzy matching is handled locally inside content.js (Levenshtein, no server round-trip).
-
-// ─── Utility: Wait for page to navigate to a new question ───────────────────
-
-/**
- * Polls the page text every 600ms until it differs from `originalText`.
- * Returns true if page changed, false if timed out.
- * This prevents the autopilot from re-answering the same question while
- * the browser is still loading the next one.
- */
 async function waitForPageChange(tabId, originalText, timeoutMs = 12000) {
     const start = Date.now();
     console.log('[*] Waiting for page to navigate to next question...');
@@ -166,19 +251,13 @@ async function waitForPageChange(tabId, originalText, timeoutMs = 12000) {
                 return true;
             }
         } catch (e) {
-            // Page might still be loading (content script temporarily unavailable)
         }
     }
     console.warn('[!] Page did not change within timeout — proceeding anyway.');
     return false;
 }
 
-/**
- * Handles the flow of extracting text, querying an external LLM via Fetch API, 
- * and instructing the content script to click the resulting element.
- */
 async function handleApiFlow(tabId) {
-    // 1. Get text from the content script
     const response = await browser.tabs.sendMessage(tabId, { action: "extract_text" });
     if (!response || !response.text) {
         throw new Error("Failed to extract text from the page.");
@@ -186,10 +265,7 @@ async function handleApiFlow(tabId) {
 
     const pageText = response.text;
 
-    // 2. Query the LLM API (All cross-origin requests handled here to avoid CORS)
     const llmResponse = await queryLLM(pageText);
-
-    // 3. Parse JSON response
     let actionData;
     try {
         actionData = JSON.parse(llmResponse);
@@ -198,7 +274,6 @@ async function handleApiFlow(tabId) {
         throw new Error("Invalid JSON from LLM");
     }
 
-    // 4. Send target back to content script to perform interaction
     if (actionData && actionData.target_element_text) {
         const clickResponse = await browser.tabs.sendMessage(tabId, {
             action: "click_element",
@@ -210,9 +285,6 @@ async function handleApiFlow(tabId) {
     return { success: false, message: "No target_element_text provided by LLM." };
 }
 
-/**
- * Calls the LLM API, strictly instructing it to return a JSON object.
- */
 async function queryLLM(pageText) {
     if (LLM_API_KEY === "YOUR_API_KEY_HERE") {
         throw new Error("Please insert your LLM API Key in background.js");
@@ -224,7 +296,6 @@ async function queryLLM(pageText) {
             { role: "system", content: SYSTEM_PROMPT },
             { role: "user", content: `Here is the webpage text:\n\n${pageText}\n\nProvide the JSON with 'target_element_text' to click.` }
         ]
-        // Note: response_format is removed as not all OpenRouter models support it. We rely on the prompt to enforce JSON.
     };
 
     const res = await fetch(LLM_API_URL, {
@@ -232,8 +303,8 @@ async function queryLLM(pageText) {
         headers: {
             "Content-Type": "application/json",
             "Authorization": `Bearer ${LLM_API_KEY}`,
-            "HTTP-Referer": "https://github.com/extension", // Optional but recommended by OpenRouter
-            "X-Title": "LLM DOM Agent" // Optional but recommended by OpenRouter
+            "HTTP-Referer": "https://github.com/extension", 
+            "X-Title": "LLM DOM Agent"
         },
         body: JSON.stringify(payload)
     });
@@ -246,19 +317,14 @@ async function queryLLM(pageText) {
     return data.choices[0].message.content;
 }
 
-// ------------------------------------------------------------------
-// Local HTTP Server Flow
-// Routes data to a local Python HTTP server running on port 5000
-// ------------------------------------------------------------------
+
 async function handleLocalServerFlow(tabId, lastPageText = '') {
-    // 0. Health check — verify server is reachable before doing work
     const isHealthy = await checkServerHealth();
     if (!isHealthy) {
         console.error("[!] Local server is not reachable. Is server.py running?");
         return { success: false, message: "Local server is not reachable. Start server.py first." };
     }
 
-    // 1. Extract text
     let response;
     try {
         response = await browser.tabs.sendMessage(tabId, { action: "extract_text" });
@@ -271,14 +337,9 @@ async function handleLocalServerFlow(tabId, lastPageText = '') {
         throw new Error("Failed to extract text from the page.");
     }
 
-    // 1b. Extract available clickable options from the page
     const availableOptions = await extractAvailableOptions(tabId);
     console.log(`[*] Found ${availableOptions.length} clickable options on page.`);
 
-    // 2. Send data to local HTTP server.
-    // NOTE: We use fetchWithTimeout directly (NO retry) because /process is not idempotent.
-    // If the server processed the request but the connection broke before the extension read
-    // the response, retrying would cause the same answer to be clicked multiple times.
     console.log('Sending text to local python server...');
     let serverRes;
     try {
@@ -290,26 +351,60 @@ async function handleLocalServerFlow(tabId, lastPageText = '') {
                 page_text: response.text,
                 available_options: availableOptions
             })
-        });
+        }, 15000); // Short timeout — just waiting for ACK, not LLM response
     } catch (e) {
-        console.error('[!] Request to local server failed:', e.message);
-        return { success: false, message: `Server communication failed: ${e.message}` };
+        console.warn('[!] Fetch to /process failed (connection dropped):', e.message);
+        console.log('[→] Attempting to recover via /last_result...');
+        try {
+            const pollRes = await fetchWithTimeout(`${LOCAL_SERVER_URL}/last_result`, { method: 'GET' }, 6000);
+            if (pollRes.ok) {
+                const recovered = await pollRes.json();
+                if (recovered && !recovered.error && (recovered.target_element_text || recovered.code_to_paste)) {
+                    console.log('[→] Recovered result from /last_result:', recovered);
+                    serverRes = { ok: true, _recoveredData: recovered };
+                } else {
+                    return { success: false, message: `Connection lost and no result to recover: ${e.message}` };
+                }
+            } else {
+                return { success: false, message: `Server communication failed: ${e.message}` };
+            }
+        } catch (pollErr) {
+            console.error('[!] Recovery poll also failed:', pollErr.message);
+            return { success: false, message: `Server communication failed: ${e.message}` };
+        }
     }
 
     let actionData;
-    try {
-        actionData = await serverRes.json();
-    } catch (e) {
-        console.error("[!] Could not parse server response as JSON:", e.message);
-        return { success: false, message: "Invalid response from server." };
+    if (serverRes._recoveredData) {
+        // Used the /last_result fallback path
+        actionData = serverRes._recoveredData;
+    } else {
+        // Normal path: parse the ACK
+        let ack;
+        try {
+            ack = await serverRes.json();
+        } catch (e) {
+            console.error("[!] Could not parse server ACK as JSON:", e.message);
+            return { success: false, message: "Invalid response from server." };
+        }
+
+        if (ack.error) {
+            throw new Error("Server error: " + ack.error);
+        }
+
+        if (ack.job_id) {
+            // Async job: poll /result/<job_id> until done
+            console.log(`[*] Job ${ack.job_id} queued. Polling for result...`);
+            actionData = await pollJobResult(ack.job_id);
+            if (!actionData) {
+                return { success: false, message: 'Job polling timed out or failed.' };
+            }
+        } else {
+            // Server returned result directly (e.g. cache hit responded synchronously)
+            actionData = ack;
+        }
     }
 
-    if (actionData.error) {
-        throw new Error("Server error: " + actionData.error);
-    }
-
-    // 3. Send target back to content script to perform interaction
-    //    content.js handles fuzzy matching locally if exact/partial match fails.
     if (actionData && actionData.target_element_text) {
         let targetText = actionData.target_element_text;
         console.log(`[*] Instructing content script to click: "${targetText}"`);
@@ -325,8 +420,6 @@ async function handleLocalServerFlow(tabId, lastPageText = '') {
             clickResponse = { success: false };
         }
 
-        // 4. If click succeeded: click Next, then wait for page to actually change.
-        //    If click failed: log verbosely and try to skip anyway.
         if (clickResponse && clickResponse.success) {
             console.log('Option clicked. Clicking Next...');
             await new Promise(resolve => setTimeout(resolve, 500));
@@ -343,9 +436,6 @@ async function handleLocalServerFlow(tabId, lastPageText = '') {
                 return { success: false, message: 'No next button found.' };
             }
 
-            // Wait until the page actually changes before starting the next cycle.
-            // This is what prevents the "same answer 3 times" bug — without this,
-            // autopilot would immediately re-process the same question from cache.
             await waitForPageChange(tabId, response.text);
             return { success: true };
 
@@ -368,7 +458,6 @@ async function handleLocalServerFlow(tabId, lastPageText = '') {
         }
 
     } else if (actionData && actionData.code_to_paste) {
-        // --- CODING QUESTION LOGIC ---
         await browser.tabs.sendMessage(tabId, {
             action: 'copy_to_clipboard',
             text: actionData.code_to_paste

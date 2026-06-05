@@ -7,7 +7,6 @@ import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 
-# Load .env manually to avoid requiring python-dotenv
 if os.path.exists('.env'):
     with open('.env', 'r', encoding='utf-8') as f:
         for line in f:
@@ -24,6 +23,8 @@ if not API_KEY:
     print("[!] WARNING: OPENROUTER_API_KEY is not set in .env file!")
 
 question_cache = {}
+last_result = {}
+jobs = {}  # Async job queue: job_id -> {status, result}
 
 # ─── Fuzzy matching utility ───────────────────────────────────────────────────
 
@@ -74,7 +75,7 @@ def find_best_fuzzy_match(target, candidates, threshold=0.4):
         if cand_lower == target_lower:
             return candidate, 1.0
 
-        # Substring containment (high confidence)
+        # Substring containment 
         if target_lower in cand_lower or cand_lower in target_lower:
             score = 0.9
         else:
@@ -103,26 +104,22 @@ def is_coding_question(text):
     lower = text.lower()
     lines_lower = [l.strip().lower() for l in text.splitlines() if l.strip()]
 
-    # ── STRONG signals: any one of these alone = coding question ─────────────
-    # Note: these are structural/UI markers that ONLY appear on coding pages,
-    # never on MCQ pages. Even partial page load signals are included so we
-    # catch the IDE before it finishes rendering.
     STRONG = [
-        "single file programming question",   # section header on this platform
-        "problem statement",                   # coding problem header
-        "input format",                        # coding problem input spec
-        "output format",                       # coding problem output spec
-        "sample test cases",                   # test case block
-        "compile & run",                       # coding IDE run button
-        "submit code",                         # coding submit button
-        "fill your code here",                 # code editor placeholder
-        "code constraints",                    # constraints section
-        "expected output",                     # test case expected output
-        "code editor",                         # code editor label
-        "provide custom input",                # coding IDE custom input feature
-        "debugger loading",                    # IDE still initializing (partial load)
-        "compiling...",                        # compile in progress
-        "running...",                          # code running in IDE
+        "single file programming question",   
+        "problem statement",                   
+        "input format",                        
+        "output format",                       
+        "sample test cases",                   
+        "compile & run",                      
+        "submit code",                         
+        "fill your code here",                 
+        "code constraints",                    
+        "expected output",                     
+        "code editor",                         
+        "provide custom input",                
+        "debugger loading",                    
+        "compiling...",                        
+        "running...",                         
     ]
     for signal in STRONG:
         if signal in lower:
@@ -258,7 +255,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
-        """Health check endpoint for the extension to verify connectivity."""
+        """Health check and result recovery endpoints."""
         if self.path == '/health':
             try:
                 self.send_response(200)
@@ -266,6 +263,35 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self.send_header('Access-Control-Allow-Origin', '*')
                 self.end_headers()
                 self.wfile.write(json.dumps({"status": "ok"}).encode('utf-8'))
+            except (ConnectionAbortedError, BrokenPipeError, ConnectionResetError, OSError):
+                pass
+            return
+
+        if self.path == '/last_result':
+            try:
+                self.send_response(200)
+                self.send_header('Content-type', 'application/json')
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers()
+                self.wfile.write(json.dumps(last_result).encode('utf-8'))
+                print(f"[*] /last_result polled — returned: {json.dumps(last_result)}")
+            except (ConnectionAbortedError, BrokenPipeError, ConnectionResetError, OSError):
+                pass
+            return
+
+        # /result/<job_id> — poll for async job result
+        if self.path.startswith('/result/'):
+            job_id = self.path[len('/result/'):]
+            job = jobs.get(job_id)
+            if not job:
+                self._safe_send_error(404, {"error": "Unknown job_id"})
+                return
+            try:
+                self.send_response(200)
+                self.send_header('Content-type', 'application/json')
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers()
+                self.wfile.write(json.dumps(job).encode('utf-8'))
             except (ConnectionAbortedError, BrokenPipeError, ConnectionResetError, OSError):
                 pass
             return
@@ -345,6 +371,10 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._safe_send_error(500, {"error": str(e)})
 
     def _handle_process(self):
+        """Immediately accepts the request and starts LLM processing in a background thread.
+        Returns a job_id so the extension can poll /result/<job_id> for the answer.
+        This prevents ConnectionAbortedError caused by the browser timing out on long LLM calls.
+        """
         try:
             content_length = int(self.headers['Content-Length'])
             post_data = self.rfile.read(content_length)
@@ -354,31 +384,46 @@ class RequestHandler(BaseHTTPRequestHandler):
 
         try:
             data = json.loads(post_data.decode('utf-8'))
+        except Exception as e:
+            self._safe_send_error(400, {"error": f"Invalid JSON: {e}"})
+            return
+
+        # Generate a short job ID and register as pending
+        job_id = str(int(time.time() * 1000))[-8:]  # 8-digit ms timestamp suffix
+        jobs[job_id] = {"status": "pending"}
+
+        # Acknowledge immediately — connection stays alive for < 1ms
+        sent = self._safe_send_response({"job_id": job_id, "status": "pending"})
+        if not sent:
+            print(f"[!] Could not send job_id acknowledgement (connection already dead).")
+            # Still process in background — /last_result will have the answer
+
+        # Run the actual LLM work in a background thread
+        t = threading.Thread(target=self._process_job, args=(job_id, data), daemon=True)
+        t.start()
+
+    def _process_job(self, job_id, data):
+        """Background thread: does classification, LLM call, caching, and stores result in jobs dict."""
+        global last_result
+        try:
             page_text = data.get('page_text', '')
             system_prompt = data.get('system_prompt', "You are an analytical engine...")
             available_options = data.get('available_options', [])
-            
-            # --- CACHE LOCALLY ---
+
             with open("extracted_data.txt", "w", encoding="utf-8") as f:
                 f.write(page_text)
             print(f"\n[*] Raw extracted text saved to extracted_data.txt ({len(page_text)} chars)")
-            
-            # --- CLASSIFY & CLEAN ---
+
             is_coding = is_coding_question(page_text)
 
             if is_coding:
                 cleaned_text = "--- CODING PROBLEM & TEST CASES ---\n\n" + page_text
-                # Override prompt for coding: only ask for code, never options
                 system_prompt = (
                     "You are an expert programmer. Read the coding problem, constraints, "
                     "and the sample test cases carefully. Write a complete, correct solution. "
                     "Respond ONLY with a valid JSON object with a single key 'code_to_paste' "
                     "mapped to the raw code string. No markdown, no triple-backticks inside the value."
                 )
-                # NEVER send available_options to the LLM for coding questions.
-                # The page may have UI buttons ('Provide Custom Input', 'Compile & Run')
-                # that look like options but aren't. Sending them causes the LLM to
-                # return target_element_text instead of code_to_paste.
                 available_options = []
                 print("[classify] Coding question — available_options suppressed.")
             else:
@@ -390,58 +435,57 @@ class RequestHandler(BaseHTTPRequestHandler):
             print(cleaned_text)
             print("="*50)
 
-            # Log available options (MCQ only — will be empty for coding)
             if available_options:
                 print(f"\n[*] Available options on page ({len(available_options)}):")
                 for i, opt in enumerate(available_options):
                     print(f"    [{i+1}] \"{opt}\"")
             elif not is_coding:
-                print("\n[!] No available options detected on page (MCQ with no radio buttons found?)")
+                print("\n[!] No options could be detected on page")
 
             print()
-            
-            # --- CACHE LOGIC ---
+
+            # Cache check
             if cleaned_text in question_cache:
                 print(f"[*] CACHE HIT! This exact question was already answered.")
                 print(f"[*] Waiting 5 seconds. Check for loops...")
-                time.sleep(5)   
+                time.sleep(5)
                 response_data = question_cache[cleaned_text]
             else:
                 print(f"[*] Querying {MODEL_NAME}...")
                 response_data = self.query_llm(cleaned_text, system_prompt, available_options)
-                # Save to cache if successful
                 if "error" not in response_data:
                     question_cache[cleaned_text] = response_data
 
-            # --- VERBOSE LOGGING: Show exactly what we're sending back ---
+            if "error" not in response_data:
+                # Normalize target_element_text to str (LLM may return a bare number)
+                if "target_element_text" in response_data:
+                    response_data["target_element_text"] = str(response_data["target_element_text"])
+                last_result = response_data
+
+            # Verbose logging
             print(f"\n{'─'*50}")
-            print(f"[*] RESPONSE TO EXTENSION:")
+            print(f"[*] RESULT FOR JOB {job_id}:")
             print(json.dumps(response_data, indent=2))
-            
-            # --- DIAGNOSTIC: Show match status for terminal visibility ---
-            target = response_data.get('target_element_text', '')
-            if target and available_options:
+
+            target = str(response_data.get('target_element_text', ''))
+            if target and target != 'None' and available_options:
                 exact_found = any(opt.strip().lower() == target.strip().lower() for opt in available_options)
                 if exact_found:
-                    print(f"[✓] LLM target \'{target}\' found exactly in available options.")
+                    print(f"[✓] LLM target '{target}' found exactly in available options.")
                 else:
-                    print(f"[~] LLM target \'{target}\' not in options list — content.js will fuzzy-match locally.")
+                    print(f"[~] LLM target '{target}' not in options list — content.js will fuzzy-match locally.")
                     print(f"[~] Available: {available_options}")
-            
+
             print(f"{'─'*50}\n")
-            
-            sent = self._safe_send_response(response_data)
-            if sent:
-                print(f"[*] Response sent successfully to extension.")
-            else:
-                print(f"[!] Response could NOT be sent (connection dead).")
-                print(f"[!] Answer for manual use: {json.dumps(response_data)}")
-            
+
+            jobs[job_id] = {"status": "done", "result": response_data}
+            print(f"[*] Job {job_id} complete. Extension can poll /result/{job_id}")
+
         except Exception as e:
-            print(f"[!] Error processing request: {e}")
             import traceback
+            print(f"[!] Error in job {job_id}: {e}")
             traceback.print_exc()
-            self._safe_send_error(500, {"error": str(e)})
+            jobs[job_id] = {"status": "error", "result": {"error": str(e)}}
                 
     def query_llm(self, page_text, system_prompt, available_options=None):
         url = API_URL
