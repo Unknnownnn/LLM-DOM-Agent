@@ -31,17 +31,13 @@ browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
 let isAutoPilot = false;
 
-// ─── Persist autopilot state so SW restarts don't kill the loop ─────────────
-
 async function setAutoPilot(val) {
     isAutoPilot = val;
     await browser.storage.session.set({ isAutoPilot: val });
 }
 
-// Keep the service worker alive every 25s during autopilot.
-// Firefox kills idle MV3 SWs after ~30s — this prevents that.
 function startKeepalive() {
-    browser.alarms.create('keepalive', { periodInMinutes: 0.4 }); // ~24s
+    browser.alarms.create('keepalive', { periodInMinutes: 0.4 }); 
 }
 function stopKeepalive() {
     browser.alarms.clear('keepalive');
@@ -49,12 +45,10 @@ function stopKeepalive() {
 
 browser.alarms.onAlarm.addListener((alarm) => {
     if (alarm.name === 'keepalive') {
-        // Ping ourselves to stay alive — no-op beyond that
         console.log('[keepalive] SW pinged to stay alive.');
     }
 });
 
-// On SW startup: check if autopilot was running before the SW was killed
 browser.runtime.onStartup.addListener(async () => {
     const { isAutoPilot: wasRunning } = await browser.storage.session.get('isAutoPilot');
     if (wasRunning) {
@@ -351,7 +345,7 @@ async function handleLocalServerFlow(tabId, lastPageText = '') {
                 page_text: response.text,
                 available_options: availableOptions
             })
-        }, 15000); // Short timeout — just waiting for ACK, not LLM response
+        }, 15000); 
     } catch (e) {
         console.warn('[!] Fetch to /process failed (connection dropped):', e.message);
         console.log('[→] Attempting to recover via /last_result...');
@@ -376,10 +370,8 @@ async function handleLocalServerFlow(tabId, lastPageText = '') {
 
     let actionData;
     if (serverRes._recoveredData) {
-        // Used the /last_result fallback path
         actionData = serverRes._recoveredData;
     } else {
-        // Normal path: parse the ACK
         let ack;
         try {
             ack = await serverRes.json();
@@ -393,14 +385,12 @@ async function handleLocalServerFlow(tabId, lastPageText = '') {
         }
 
         if (ack.job_id) {
-            // Async job: poll /result/<job_id> until done
             console.log(`[*] Job ${ack.job_id} queued. Polling for result...`);
             actionData = await pollJobResult(ack.job_id);
             if (!actionData) {
                 return { success: false, message: 'Job polling timed out or failed.' };
             }
         } else {
-            // Server returned result directly (e.g. cache hit responded synchronously)
             actionData = ack;
         }
     }

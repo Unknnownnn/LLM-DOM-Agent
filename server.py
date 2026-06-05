@@ -92,6 +92,89 @@ def find_best_fuzzy_match(target, candidates, threshold=0.4):
 
 # ─── Text cleaning ────────────────────────────────────────────────────────────
 
+def strip_pii(text):
+    """
+    Remove PII and exam-header boilerplate from coding question text.
+    Two-pass approach:
+      Pass 1 - remove lines matching explicit PII patterns.
+      Pass 2 - also remove up to 2 lines BEFORE a bare reg-number line
+               (catches plain student names with no label).
+    Pass 2 works on the ORIGINAL lines so the anchor is still present.
+    """
+    PII_LINE_PATTERNS = [
+        # Email
+        re.compile(r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}'),
+        # Reg / Roll / Enrollment with label
+        re.compile(r'\b(reg(istration)?|roll|enrollment|enroll|student|candidate)\s*(no|num|number|id|\#|:)[\s:\-]*[A-Z0-9\-\/]+', re.IGNORECASE),
+        re.compile(r'\b(reg|roll|enroll)\s*[:\-]?\s*[A-Z0-9]{5,}', re.IGNORECASE),
+        # Bare reg-number tokens: 23BCE1758, EE19B042
+        re.compile(r'\b\d{2}[A-Z]{2,4}\d{3,}\b'),
+        re.compile(r'\b[A-Z]{2,4}\d{6,}\b'),
+        # Phone / long numeric ID
+        re.compile(r'\b\d{10,}\b'),
+        # Name / candidate label lines
+        re.compile(r'\b(name|candidate name|student name)\s*[:\-]', re.IGNORECASE),
+        # Mobile / phone
+        re.compile(r'\b(mobile|phone|contact)\s*(no|number)?\s*[:\-]', re.IGNORECASE),
+        # Degree / batch / year header lines
+        re.compile(r'\b(degree|branch|department|batch|year|semester|section)\s*[:\-]', re.IGNORECASE),
+        re.compile(r'\bB\.?Tech\b', re.IGNORECASE),
+        re.compile(r'\bM\.?Tech\b', re.IGNORECASE),
+        # Academic year range "2021-2025"
+        re.compile(r'\b20\d{2}\b.*\b20\d{2}\b'),
+        # Standalone batch year alone on a line (e.g. "2027")
+        re.compile(r'^\s*20\d{2}\s*$'),
+        # Internet / system status
+        re.compile(r'\b(internet|network|system)\s*(status|connection)\s*[:\-]?', re.IGNORECASE),
+        re.compile(r'\b(online|offline|connected|disconnected)\b', re.IGNORECASE),
+        # Section counter "Section 5/5"
+        re.compile(r'\bsection\s*\d+\s*/\s*\d+\b', re.IGNORECASE),
+        # Exam / section name labels
+        re.compile(r'\badvance\s*coding\s*ability\b', re.IGNORECASE),
+        # Exam brand names (with or without underscores between tokens)
+        re.compile(r'\b(TCS|NQT|AMCAT|eLitmus|CoCubes)\b'),
+        re.compile(r'TCS[\s_]NQT', re.IGNORECASE),          # TCS_NQT_D style
+        re.compile(r'\bpractice[\s_]test\b', re.IGNORECASE), # Practice_Test_3
+        # Bare label-only lines ("Email :", "Degree :", etc.)
+        re.compile(r'^\s*(email|degree|branch|batch|year|mobile|phone|name|test\s*name|roll\s*(number|no)?)\s*[:\-]?\s*$', re.IGNORECASE),
+        # Question counter alone "(3)"
+        re.compile(r'^\s*\(\d+\)\s*$'),
+        # Countdown timer alone on a line "159:37"
+        re.compile(r'^\s*\d{1,3}:\d{2}\s*$'),
+        # Submit / navigation buttons alone on a line
+        re.compile(r'^\s*(submit\s*(test|answer)?|next(\s*question)?|previous|save\s*&\s*next)\s*$', re.IGNORECASE),
+    ]
+
+    # Anchor: a line that is solely a bare reg number (e.g. "23BCE1758")
+    REG_ANCHOR = re.compile(r'^\s*(\d{2}[A-Z]{2,4}\d{3,}|[A-Z]{2,4}\d{6,})\s*$')
+
+    lines = text.splitlines()
+
+    # ── Pass 1: collect indices to drop (pattern-based), on original lines ────
+    remove_indices = set()
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped and any(p.search(stripped) for p in PII_LINE_PATTERNS):
+            remove_indices.add(i)
+
+    # ── Pass 2: also remove up to 2 non-empty lines BEFORE a reg-anchor ───────
+    # Works on original `lines` so the anchor itself is still present here.
+    CONTEXT_LINES = 2
+    for i, line in enumerate(lines):
+        if REG_ANCHOR.match(line):
+            removed = 0
+            j = i - 1
+            while j >= 0 and removed < CONTEXT_LINES:
+                if lines[j].strip():
+                    if j not in remove_indices:
+                        remove_indices.add(j)
+                    removed += 1
+                j -= 1
+
+    cleaned = [line for i, line in enumerate(lines) if i not in remove_indices]
+    return '\n'.join(cleaned)
+
+
 def is_coding_question(text):
     """
     Classify whether the page is a coding/programming question or an MCQ.
@@ -417,7 +500,8 @@ class RequestHandler(BaseHTTPRequestHandler):
             is_coding = is_coding_question(page_text)
 
             if is_coding:
-                cleaned_text = "--- CODING PROBLEM & TEST CASES ---\n\n" + page_text
+                pii_stripped = strip_pii(page_text)
+                cleaned_text = "--- CODING PROBLEM & TEST CASES ---\n\n" + pii_stripped
                 system_prompt = (
                     "You are an expert programmer. Read the coding problem, constraints, "
                     "and the sample test cases carefully. Write a complete, correct solution. "
@@ -500,8 +584,13 @@ class RequestHandler(BaseHTTPRequestHandler):
             user_msg += f"The available clickable options on the page are:\n"
             for i, opt in enumerate(available_options):
                 user_msg += f"  {i+1}. {opt}\n"
-            user_msg += f"\nYou MUST pick one of these exact options. "
-        user_msg += "Respond ONLY with a valid JSON object containing a single key 'target_element_text' mapped to the exact string of the correct option to click."
+            user_msg += "\nYou MUST pick one of these exact options. "
+            user_msg += "Respond ONLY with a valid JSON object containing a single key 'target_element_text' mapped to the exact string of the correct option to click."
+        else:
+            # Coding question: system prompt already has the full instruction.
+            # Do NOT add the MCQ instruction here — it would override the system prompt.
+            user_msg += "Follow the instructions in the system prompt exactly."
+
 
         payload = {
             "model": MODEL_NAME,
@@ -531,7 +620,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         
         print("\n" + "="*50)
         print("RAW MODEL RESPONSE:")
-        print("="*50)
+        print("\n")
         print(content)
         print("="*50 + "\n")
         
