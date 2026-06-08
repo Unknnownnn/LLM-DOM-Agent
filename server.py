@@ -24,9 +24,7 @@ if not API_KEY:
 
 question_cache = {}
 last_result = {}
-jobs = {}  # Async job queue: job_id -> {status, result}
-
-# ─── Fuzzy matching utility ───────────────────────────────────────────────────
+jobs = {}  
 
 def levenshtein_distance(s1, s2):
     """Compute Levenshtein edit distance between two strings."""
@@ -71,11 +69,9 @@ def find_best_fuzzy_match(target, candidates, threshold=0.4):
     for candidate in candidates:
         cand_lower = candidate.strip().lower()
 
-        # Exact match
         if cand_lower == target_lower:
             return candidate, 1.0
 
-        # Substring containment 
         if target_lower in cand_lower or cand_lower in target_lower:
             score = 0.9
         else:
@@ -89,9 +85,6 @@ def find_best_fuzzy_match(target, candidates, threshold=0.4):
         return best_match, best_score
     return None, 0.0
 
-
-# ─── Text cleaning ────────────────────────────────────────────────────────────
-
 def strip_pii(text):
     """
     Remove PII and exam-header boilerplate from coding question text.
@@ -102,55 +95,36 @@ def strip_pii(text):
     Pass 2 works on the ORIGINAL lines so the anchor is still present.
     """
     PII_LINE_PATTERNS = [
-        # Email
         re.compile(r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}'),
-        # Reg / Roll / Enrollment with label
         re.compile(r'\b(reg(istration)?|roll|enrollment|enroll|student|candidate)\s*(no|num|number|id|\#|:)[\s:\-]*[A-Z0-9\-\/]+', re.IGNORECASE),
         re.compile(r'\b(reg|roll|enroll)\s*[:\-]?\s*[A-Z0-9]{5,}', re.IGNORECASE),
-        # Bare reg-number tokens: 23BCE1758, EE19B042
         re.compile(r'\b\d{2}[A-Z]{2,4}\d{3,}\b'),
         re.compile(r'\b[A-Z]{2,4}\d{6,}\b'),
-        # Phone / long numeric ID
         re.compile(r'\b\d{10,}\b'),
-        # Name / candidate label lines
         re.compile(r'\b(name|candidate name|student name)\s*[:\-]', re.IGNORECASE),
-        # Mobile / phone
         re.compile(r'\b(mobile|phone|contact)\s*(no|number)?\s*[:\-]', re.IGNORECASE),
-        # Degree / batch / year header lines
         re.compile(r'\b(degree|branch|department|batch|year|semester|section)\s*[:\-]', re.IGNORECASE),
         re.compile(r'\bB\.?Tech\b', re.IGNORECASE),
         re.compile(r'\bM\.?Tech\b', re.IGNORECASE),
-        # Academic year range "2021-2025"
         re.compile(r'\b20\d{2}\b.*\b20\d{2}\b'),
-        # Standalone batch year alone on a line (e.g. "2027")
         re.compile(r'^\s*20\d{2}\s*$'),
-        # Internet / system status
         re.compile(r'\b(internet|network|system)\s*(status|connection)\s*[:\-]?', re.IGNORECASE),
         re.compile(r'\b(online|offline|connected|disconnected)\b', re.IGNORECASE),
-        # Section counter "Section 5/5"
         re.compile(r'\bsection\s*\d+\s*/\s*\d+\b', re.IGNORECASE),
-        # Exam / section name labels
         re.compile(r'\badvance\s*coding\s*ability\b', re.IGNORECASE),
-        # Exam brand names (with or without underscores between tokens)
         re.compile(r'\b(TCS|NQT|AMCAT|eLitmus|CoCubes)\b'),
-        re.compile(r'TCS[\s_]NQT', re.IGNORECASE),          # TCS_NQT_D style
-        re.compile(r'\bpractice[\s_]test\b', re.IGNORECASE), # Practice_Test_3
-        # Bare label-only lines ("Email :", "Degree :", etc.)
+        re.compile(r'TCS[\s_]NQT', re.IGNORECASE),          
+        re.compile(r'\bpractice[\s_]test\b', re.IGNORECASE), 
         re.compile(r'^\s*(email|degree|branch|batch|year|mobile|phone|name|test\s*name|roll\s*(number|no)?)\s*[:\-]?\s*$', re.IGNORECASE),
-        # Question counter alone "(3)"
         re.compile(r'^\s*\(\d+\)\s*$'),
-        # Countdown timer alone on a line "159:37"
         re.compile(r'^\s*\d{1,3}:\d{2}\s*$'),
-        # Submit / navigation buttons alone on a line
         re.compile(r'^\s*(submit\s*(test|answer)?|next(\s*question)?|previous|save\s*&\s*next)\s*$', re.IGNORECASE),
     ]
 
-    # Anchor: a line that is solely a bare reg number (e.g. "23BCE1758")
     REG_ANCHOR = re.compile(r'^\s*(\d{2}[A-Z]{2,4}\d{3,}|[A-Z]{2,4}\d{6,})\s*$')
 
     lines = text.splitlines()
 
-    # ── Pass 1: collect indices to drop (pattern-based), on original lines ────
     remove_indices = set()
     for i, line in enumerate(lines):
         stripped = line.strip()
@@ -207,14 +181,12 @@ def is_coding_question(text):
             print(f"[classify] CODING (strong signal: '{signal}')")
             return True
 
-    # ── STRUCTURAL: input+output pattern together = unambiguous coding page ──
     has_input_format  = any("input" in l and ("format" in l or ":" in l) for l in lines_lower)
     has_output_format = any("output" in l and ("format" in l or ":" in l) for l in lines_lower)
     if has_input_format and has_output_format:
         print("[classify] CODING (structural: input format + output format both present)")
         return True
 
-    # ── WEAK signals: need 2+ hits to be sure ────────────────────────────────
     WEAK = [
         "coding question", "programming", "test case", "compiler",
         "run code", "compile", "code snippet", "algorithm", "function",
@@ -262,7 +234,6 @@ def clean_extracted_text(text):
             
         return "--- QUESTION BLOCK ---\n\n" + "\n".join(filtered_block)
         
-    # --- HEURISTIC 2: Find Question Mark (?) ---
     q_index = -1
     for i in range(len(lines)-1, -1, -1):
         if '?' in lines[i]:
@@ -292,7 +263,6 @@ def clean_extracted_text(text):
             
         return "--- QUESTION BLOCK ---\n\n" + "\n".join(filtered_block)
         
-    # --- HEURISTIC 3: Fallback (Just grab everything before the next button) ---
     end_index = -1
     for i, line in enumerate(lines):
         if line.lower() in ["submit answer", "submit", "next", "save & next"]:
@@ -313,7 +283,6 @@ def clean_extracted_text(text):
     return "--- RAW CONDENSED TEXT ---\n\n" + "\n".join(lines)
 
 
-# ─── Threaded HTTP Server ─────────────────────────────────────────────────────
 
 class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
     """Handle requests in separate threads to prevent blocking."""
@@ -321,12 +290,10 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 
 class RequestHandler(BaseHTTPRequestHandler):
-    # Suppress default logging to keep terminal clean (we log manually)
     def log_message(self, format, *args):
         return
 
     def do_OPTIONS(self):
-        # Handle CORS preflight
         self.send_response(200, "ok")
         self.send_header('Access-Control-Allow-Origin', '*')
         self.send_header('Access-Control-Allow-Methods', 'POST, OPTIONS')
@@ -358,7 +325,6 @@ class RequestHandler(BaseHTTPRequestHandler):
                 pass
             return
 
-        # /result/<job_id> — poll for async job result
         if self.path.startswith('/result/'):
             job_id = self.path[len('/result/'):]
             job = jobs.get(job_id)
@@ -467,17 +433,13 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._safe_send_error(400, {"error": f"Invalid JSON: {e}"})
             return
 
-        # Generate a short job ID and register as pending
-        job_id = str(int(time.time() * 1000))[-8:]  # 8-digit ms timestamp suffix
+        job_id = str(int(time.time() * 1000))[-8:] 
         jobs[job_id] = {"status": "pending"}
 
-        # Acknowledge immediately — connection stays alive for < 1ms
         sent = self._safe_send_response({"job_id": job_id, "status": "pending"})
         if not sent:
             print(f"[!] Could not send job_id acknowledgement (connection already dead).")
-            # Still process in background — /last_result will have the answer
 
-        # Run the actual LLM work in a background thread
         t = threading.Thread(target=self._process_job, args=(job_id, data), daemon=True)
         t.start()
 
@@ -508,23 +470,19 @@ class RequestHandler(BaseHTTPRequestHandler):
                 print("[classify] Coding question — available_options suppressed.")
             else:
                 cleaned_text = clean_extracted_text(page_text)
-                # Fallback: if content.js failed to find all 4 options, try to recover them
-                # from the bottom of the cleaned text block (where options usually reside).
                 if len(available_options) < 4:
                     lines = [line.strip() for line in cleaned_text.splitlines() if line.strip()]
-                    # Grab up to the last 5 lines, filter out headers/junk
                     bottom_lines = lines[-5:]
                     recovered = []
                     for line in bottom_lines:
                         if line == "--- QUESTION BLOCK ---" or line == "--- RAW CONDENSED TEXT ---": continue
-                        if len(line) > 150: continue # options usually aren't giant paragraphs
+                        if len(line) > 150: continue 
                         if line not in available_options and line not in recovered:
                             recovered.append(line)
                     
                     if recovered:
                         print(f"[*] Recovered {len(recovered)} potential options from text bottom to supplement options.")
                         available_options.extend(recovered)
-                        # Keep only the last 4 if we somehow overshot (unlikely to have >5)
                         if len(available_options) > 4:
                             available_options = available_options[-4:]
 
@@ -544,7 +502,6 @@ class RequestHandler(BaseHTTPRequestHandler):
 
             print()
 
-            # Cache check
             if cleaned_text in question_cache:
                 print(f"[*] CACHE HIT! This exact question was already answered.")
                 print(f"[*] Waiting 5 seconds. Check for loops...")
@@ -557,12 +514,9 @@ class RequestHandler(BaseHTTPRequestHandler):
                     question_cache[cleaned_text] = response_data
 
             if "error" not in response_data:
-                # Normalize target_element_text to str (LLM may return a bare number)
                 if "target_element_text" in response_data:
                     response_data["target_element_text"] = str(response_data["target_element_text"])
                 last_result = response_data
-
-            # Verbose logging
             print(f"\n{'─'*50}")
             print(f"[*] RESULT FOR JOB {job_id}:")
             print(json.dumps(response_data, indent=2))
@@ -594,7 +548,6 @@ class RequestHandler(BaseHTTPRequestHandler):
             "Content-Type": "application/json"
         }
 
-        # Build user message with available options for better accuracy
         user_msg = f"Here is the webpage text:\n\n{page_text}\n\n"
         if available_options and len(available_options) > 0:
             user_msg += f"The available clickable options on the page are:\n"
@@ -603,8 +556,6 @@ class RequestHandler(BaseHTTPRequestHandler):
             user_msg += "\nYou MUST pick one of these exact options. "
             user_msg += "Respond ONLY with a valid JSON object containing a single key 'target_element_text' mapped to the exact string of the correct option to click."
         else:
-            # Coding question: system prompt already has the full instruction.
-            # Do NOT add the MCQ instruction here — it would override the system prompt.
             user_msg += "Follow the instructions in the system prompt exactly."
 
 
@@ -657,8 +608,6 @@ class RequestHandler(BaseHTTPRequestHandler):
             else:
                 return {"error": "Failed to parse JSON", "raw_content": content}
 
-        # Normalize alternative keys that LLMs sometimes return instead of the expected ones.
-        # MCQ fallback keys → target_element_text
         FALLBACK_MCQ_KEYS = ["correct_option", "answer", "selected_option", "choice", "option", "correct_answer"]
         if "target_element_text" not in parsed and "code_to_paste" not in parsed:
             for key in FALLBACK_MCQ_KEYS:
@@ -666,7 +615,6 @@ class RequestHandler(BaseHTTPRequestHandler):
                     val = parsed[key]
                     print(f"[!] LLM used non-standard key '{key}' — mapping to 'target_element_text'")
                     return {"target_element_text": str(val)}
-            # Last resort: if there's exactly one string value, use it
             str_values = {k: v for k, v in parsed.items() if isinstance(v, str)}
             if len(str_values) == 1:
                 key, val = next(iter(str_values.items()))

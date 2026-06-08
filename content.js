@@ -47,7 +47,6 @@ function extractAvailableOptions() {
     const results = [];
     const seen = new Set();
 
-    // ── Pass 1: walk text nodes, look for radio/checkbox/label/role ancestors ──
     const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null, false);
     let node;
 
@@ -95,9 +94,7 @@ function extractAvailableOptions() {
         }
     }
 
-    // ── Pass 2: fallback for platforms with clickable divs and no radio inputs ──
-    // Look for elements that have a click handler or data-* attribute and whose
-    // text is short (< 120 chars) — typical of MCQ option divs.
+
     if (results.length === 0) {
         const candidates = document.querySelectorAll(
             'li, [data-key], [data-value], [data-option], [data-id], [data-index], ' +
@@ -108,7 +105,6 @@ function extractAvailableOptions() {
             if (!text || text.length < 1 || text.length > 120) continue;
             if (seen.has(text.toLowerCase())) continue;
             if (isJunk(text)) continue;
-            // Skip if element contains child elements (probably a container, not a leaf option)
             if (el.children.length > 3) continue;
             seen.add(text.toLowerCase());
             results.push(text);
@@ -190,7 +186,6 @@ function clickNodeText(targetText) {
 
     if (matches.length === 0) return false;
 
-    // Helper to check if a node has a valid clickable option wrapper
     function findClickableWrapper(startNode) {
         let el = startNode.parentElement;
         while (el && el.tagName !== 'BODY') {
@@ -207,7 +202,7 @@ function clickNodeText(targetText) {
             ) {
                 return el;
             }
-            // Check if it contains a radio/checkbox
+            
             const radio = el.querySelector('input[type="radio"], input[type="checkbox"]');
             if (radio) return el;
             
@@ -216,7 +211,6 @@ function clickNodeText(targetText) {
         return null;
     }
 
-    // Score and pick the best node to click
     let element = null;
     let bestScore = -1;
 
@@ -224,11 +218,11 @@ function clickNodeText(targetText) {
         const wrapper = findClickableWrapper(m.node);
         let score = 0;
         if (m.exact) score += 10;
-        if (wrapper) score += 5; // Heavily prefer actual option elements
+        if (wrapper) score += 5; 
         
         if (score > bestScore) {
             bestScore = score;
-            element = wrapper || m.node.parentElement; // Fallback to raw parent if no wrapper
+            element = wrapper || m.node.parentElement; 
         }
     }
 
@@ -259,7 +253,7 @@ function clickElementByText(targetText) {
     const options = extractAvailableOptions();
 
     if (options.length === 0) {
-        console.warn('[✗] No options found on page for fuzzy matching.');
+        console.warn('[X] No options found on page for fuzzy matching.');
         return false;
     }
 
@@ -269,12 +263,12 @@ function clickElementByText(targetText) {
     if (result) {
         console.log(`[fuzzy] Best match: "${result.match}" (score: ${result.score.toFixed(2)})`);
         if (clickNodeText(result.match)) {
-            console.log(`[fuzzy] ✓ Clicked fuzzy match "${result.match}"`);
+            console.log(`[fuzzy] Clicked fuzzy match "${result.match}"`);
             return true;
         }
-        console.warn(`[fuzzy] ✗ Found match "${result.match}" but could not click it.`);
+        console.warn(`[fuzzy] Found match "${result.match}" but could not click it.`);
     } else {
-        console.warn(`[fuzzy] ✗ Nothing similar enough to "${targetText}" found.`);
+        console.warn(`[fuzzy] Nothing similar enough to "${targetText}" found.`);
         console.warn('[fuzzy] Available options were:', options);
     }
 
